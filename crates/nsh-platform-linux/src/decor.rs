@@ -1368,10 +1368,10 @@ mod tests {
                         renderer.render_texture(drawing.to_node().unwrap(), Some(&bounds));
                     let mut downloader = gdk::TextureDownloader::new(&texture);
                     downloader.set_format(gdk::MemoryFormat::R8g8b8a8Premultiplied);
-                    downloader.download_bytes().0
+                    downloader.download_bytes()
                 };
                 let node = content();
-                let expected = render(&|s| {
+                let (expected, stride) = render(&|s| {
                     s.push_fill(&shape.path(), gsk::FillRule::Winding);
                     s.append_node(&node);
                     s.pop();
@@ -1381,19 +1381,26 @@ mod tests {
                     origin,
                     scale,
                 };
-                let actual = render(&|s| append_clipped(s, &clip, &node));
-                let error = actual
+                let (actual, _) = render(&|s| append_clipped(s, &clip, &node));
+                let (at, error) = actual
                     .iter()
                     .zip(expected.iter())
                     .map(|(a, b)| a.abs_diff(*b))
-                    .max()
+                    .enumerate()
+                    .max_by_key(|&(_, error)| error)
                     .unwrap();
+                let (x, y) = (at % stride / 4, at / stride);
+                let pixel = |p: &[u8]| &p[at / 4 * 4..at / 4 * 4 + 4];
                 // Seams or doubled corners differ by 30 levels and more; the
                 // path mask itself covers the box's outer edge pixels a few
                 // levels short of exact (76 for 76.5 at half coverage).
                 assert!(
                     error <= 10,
-                    "scale {scale}, radii {radii:?}: differs by {error} channel levels"
+                    "{}: scale {scale}, radii {radii:?}: differs by {error} channel levels \
+                     at pixel ({x}, {y}): {:?} for {:?}",
+                    renderer.type_().name(),
+                    pixel(&actual[..]),
+                    pixel(&expected[..]),
                 );
             }
             window.destroy();
