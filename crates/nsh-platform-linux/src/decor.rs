@@ -1331,7 +1331,18 @@ mod tests {
             window.set_default_size(200, 100);
             window.present();
             assert!(crate::gtk_test::wait_until(|| window.renderer().is_some()));
-            let renderer = window.renderer().unwrap();
+            let surface = window.surface().unwrap();
+            // TEMPORARY DIAGNOSTICS: every renderer the display offers.
+            let mut renderers: Vec<gsk::Renderer> = vec![window.renderer().unwrap()];
+            for other in [
+                gsk::CairoRenderer::new().upcast::<gsk::Renderer>(),
+                gsk::GLRenderer::new().upcast(),
+                gsk::NglRenderer::new().upcast(),
+            ] {
+                if other.realize(Some(&surface)).is_ok() {
+                    renderers.push(other);
+                }
+            }
             // A translucent gradient, so a doubly drawn or missed seam shows.
             let content = || {
                 let s = gtk::Snapshot::new();
@@ -1346,64 +1357,94 @@ mod tests {
                 );
                 s.to_node().unwrap()
             };
-            for (scale, origin, radii) in [
-                (1.0, (0.0, 0.0), [20.0; 4]),
-                (1.6, (13.3, 7.7), [20.0; 4]),
-                (2.0, (0.5, 0.25), [24.0, 0.0, 12.0, 60.0]),
-                (1.6, (0.0, 0.0), [100.0; 4]),
-            ] {
-                let shape = Shape::new((0.0, 0.0, 300.0, 180.0), radii, true);
-                let render = |draw: &dyn Fn(&gtk::Snapshot)| {
-                    let drawing = gtk::Snapshot::new();
-                    drawing.scale(scale, scale);
-                    drawing.translate(&graphene::Point::new(origin.0, origin.1));
-                    draw(&drawing);
-                    let bounds = graphene::Rect::new(
-                        0.0,
-                        0.0,
-                        ((origin.0 + 300.0) * scale).ceil(),
-                        ((origin.1 + 180.0) * scale).ceil(),
+            let mut report = String::new();
+            let mut failed = false;
+            for (ix, renderer) in renderers.iter().enumerate() {
+                for (scale, origin, radii) in [
+                    (1.0, (0.0, 0.0), [20.0; 4]),
+                    (1.6, (13.3, 7.7), [20.0; 4]),
+                    (2.0, (0.5, 0.25), [24.0, 0.0, 12.0, 60.0]),
+                    (1.6, (0.0, 0.0), [100.0; 4]),
+                ] {
+                    let shape = Shape::new((0.0, 0.0, 300.0, 180.0), radii, true);
+                    let render = |draw: &dyn Fn(&gtk::Snapshot)| {
+                        let drawing = gtk::Snapshot::new();
+                        drawing.scale(scale, scale);
+                        drawing.translate(&graphene::Point::new(origin.0, origin.1));
+                        draw(&drawing);
+                        let bounds = graphene::Rect::new(
+                            0.0,
+                            0.0,
+                            ((origin.0 + 300.0) * scale).ceil(),
+                            ((origin.1 + 180.0) * scale).ceil(),
+                        );
+                        let texture =
+                            renderer.render_texture(drawing.to_node().unwrap(), Some(&bounds));
+                        let mut downloader = gdk::TextureDownloader::new(&texture);
+                        downloader.set_format(gdk::MemoryFormat::R8g8b8a8Premultiplied);
+                        let (bytes, stride) = downloader.download_bytes();
+                        (bytes.to_vec(), stride)
+                    };
+                    let node = content();
+                    let (expected, stride) = render(&|s| {
+                        s.push_fill(&shape.path(), gsk::FillRule::Winding);
+                        s.append_node(&node);
+                        s.pop();
+                    });
+                    let clip = PiecewiseClip {
+                        shape,
+                        origin,
+                        scale,
+                    };
+                    let (actual, _) = render(&|s| append_clipped(s, &clip, &node));
+                    let (at, error) = actual
+                        .iter()
+                        .zip(expected.iter())
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .enumerate()
+                        .max_by_key(|&(_, error)| error)
+                        .unwrap();
+                    let (x, y) = (at % stride / 4, at / stride);
+                    let width = stride / 4;
+                    let row = |p: &[u8]| -> Vec<u8> {
+                        (x.saturating_sub(3)..(x + 4).min(width))
+                            .map(|c| p[y * stride + c * 4 + 3])
+                            .collect()
+                    };
+                    let column = |p: &[u8]| -> Vec<u8> {
+                        (y.saturating_sub(3)..(y + 4).min(expected.len() / stride))
+                            .map(|r| p[r * stride + x * 4 + 3])
+                            .collect()
+                    };
+                    let i = at / 4 * 4;
+                    let bad = actual
+                        .iter()
+                        .zip(expected.iter())
+                        .filter(|(a, b)| a.abs_diff(**b) > 10)
+                        .count();
+                    report += &format!(
+                        "\n{}: scale {scale}, origin {origin:?}, radii {radii:?}: \
+                         {error} levels at ({x}, {y}) of {}x{}, {bad} channels over 10; \
+                         actual {:?} expected {:?}; alpha row {:?} for {:?}; \
+                         alpha column {:?} for {:?}",
+                        renderer.type_().name(),
+                        width,
+                        expected.len() / stride,
+                        &actual[i..i + 4],
+                        &expected[i..i + 4],
+                        row(&actual),
+                        row(&expected),
+                        column(&actual),
+                        column(&expected),
                     );
-                    let texture =
-                        renderer.render_texture(drawing.to_node().unwrap(), Some(&bounds));
-                    let mut downloader = gdk::TextureDownloader::new(&texture);
-                    downloader.set_format(gdk::MemoryFormat::R8g8b8a8Premultiplied);
-                    downloader.download_bytes()
-                };
-                let node = content();
-                let (expected, stride) = render(&|s| {
-                    s.push_fill(&shape.path(), gsk::FillRule::Winding);
-                    s.append_node(&node);
-                    s.pop();
-                });
-                let clip = PiecewiseClip {
-                    shape,
-                    origin,
-                    scale,
-                };
-                let (actual, _) = render(&|s| append_clipped(s, &clip, &node));
-                let (at, error) = actual
-                    .iter()
-                    .zip(expected.iter())
-                    .map(|(a, b)| a.abs_diff(*b))
-                    .enumerate()
-                    .max_by_key(|&(_, error)| error)
-                    .unwrap();
-                let (x, y) = (at % stride / 4, at / stride);
-                let pixel = |p: &[u8]| &p[at / 4 * 4..at / 4 * 4 + 4];
-                // Seams or doubled corners differ by 30 levels and more; the
-                // path mask itself covers the box's outer edge pixels a few
-                // levels short of exact (76 for 76.5 at half coverage).
-                assert!(
-                    error <= 10,
-                    "{}: scale {scale}, radii {radii:?}: differs by {error} channel levels \
-                     at pixel ({x}, {y}): {:?} for {:?}",
-                    renderer.type_().name(),
-                    pixel(&actual[..]),
-                    pixel(&expected[..]),
-                );
+                    failed |= ix == 0 && error > 10;
+                }
+            }
+            for renderer in &renderers[1..] {
+                renderer.unrealize();
             }
             window.destroy();
+            panic!("failed: {failed}{report}");
         });
     }
 
